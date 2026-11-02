@@ -48,6 +48,7 @@ class GraphState(TypedDict):
     unsupported: list[str]
     evidence_ok: bool
     revisions: int
+    fell_back: bool
 
 
 class RetrieveDecision(BaseModel):
@@ -188,13 +189,33 @@ def revise(state: GraphState):
     revisions = state.get("revisions", 0) + 1
     return {"answer": answer, "revisions": revisions}
 
-def route_after_sup(state: GraphState) -> Literal["__end__", "revise"]:
+def build_fallback(evidence, relevant_docs):
+    lines = []
+    seen = set()
+    for quote in evidence:
+        quote = quote.strip()
+        if not quote or quote.lower() in seen:
+            continue
+        source = next((doc for doc in relevant_docs if quote_found(quote, doc.page_content)), None)
+        if source is None:
+            continue
+        seen.add(quote.lower())
+        lines.append(f'- "{quote}" [{source.metadata["id"]}]')
+    if not lines:
+        return NOT_COVERED
+    return "From the care sheets:\n" + "\n".join(lines) + "\nThe care sheets don't cover the rest of your question."
+
+def fallback(state: GraphState):
+    answer = build_fallback(state.get("evidence",[]), state.get("relevant_docs", []))
+    return {"answer": answer, "fell_back": True}
+
+def route_after_sup(state: GraphState) -> Literal["__end__", "revise", "fallback"]:
     if state['issup'] == "fully_supported":
         return END
     elif state.get("revisions", 0) < MAX_REVISIONS:
         return "revise"
     else:
-        return END
+        return "fallback"
 graph = StateGraph(GraphState)
 
 graph.add_node("decide_retrieval", decide_retrieval)
@@ -205,6 +226,7 @@ graph.add_node("is_relevant", is_relevant)
 graph.add_node("no_answer", no_answer)
 graph.add_node("is_sup", is_sup)
 graph.add_node("revise", revise)
+graph.add_node("fallback", fallback)
 
 graph.add_edge(START, "decide_retrieval")
 
@@ -223,13 +245,16 @@ graph.add_conditional_edges("is_relevant", route_after_relevance, {
 graph.add_edge("generate", "is_sup")
 graph.add_conditional_edges("is_sup", route_after_sup, {
     END: END,
-    "revise": "revise"
+    "revise": "revise",
+    "fallback": "fallback"
 })
 
 graph.add_edge("revise", "is_sup")
 
 graph.add_edge("answer_direct", END)
+graph.add_edge("fallback", END)
 graph.add_edge("no_answer", END)
+
 app = graph.compile()
 
 if __name__ == "__main__":
@@ -255,7 +280,7 @@ if __name__ == "__main__":
           else "FAIL", "something relevant -> generate")
     print("ok  " if route_after_sup({"issup": "fully_supported", "revisions": 0}) == END else "FAIL", "fully supported ends")
     print("ok  " if route_after_sup({"issup": "partially_supported"}) == "revise" else "FAIL", "first miss goes to revise")
-    print("ok  " if route_after_sup({"issup": "partially_supported", "revisions": 1}) == END else "FAIL", "cap reached ends")
+    print("ok  " if route_after_sup({"issup": "partially_supported", "revisions": 1}) == "fallback" else "FAIL", "cap reached -> fallback")
     print("ok  " if route_after_sup({"issup": "no_support", "revisions": 0}) == "revise" else "FAIL", "no support also revises once")
 
     print("\n--- quote_found and bullet_list (free) ---")
@@ -267,16 +292,27 @@ if __name__ == "__main__":
     print("ok  " if bullet_list(["a claim", "another"]) == "- a claim\n- another" else "FAIL", "bullets one per line")
     print("ok  " if bullet_list([]) == "none" else "FAIL", "empty list says none")
 
+    print("\n--- build_fallback (free) ---")
+    snake = Document(page_content="Snake Plant (light: low; toxicity: toxic to cats and dogs)\n\n## Pets\nToxic to cats and dogs if eaten.",
+                     metadata={"id": "snake_plant"})
+    reply = build_fallback(["Toxic to cats and dogs if eaten.", "Feed every 4 weeks."], [snake])
+    print(reply)
+    print("ok  " if '"Toxic to cats and dogs if eaten." [snake_plant]' in reply else "FAIL", "verified quote kept, with its plant id")
+    print("ok  " if "Feed every 4 weeks" not in reply else "FAIL", "unverified quote dropped")
+    print("ok  " if build_fallback(["Feed every 4 weeks."], [snake]) == NOT_COVERED else "FAIL", "no verified quotes -> NOT_COVERED")
+    print("ok  " if build_fallback([], [snake]) == NOT_COVERED else "FAIL", "no evidence at all -> NOT_COVERED")
+
     if len(sys.argv) > 1 and sys.argv[1] == "step2b":
-        print("\n--- step 2b: is_sup + revise, on all 20 questions (about 130 model calls) ---")
+        print("\n--- step 2b: is_sup + revise + fallback, on all 20 questions (about 130 model calls) ---")
         citation = re.compile(r"\[([a-z_]+)\]")
         rows = [json.loads(line) for line in open("eval/questions.jsonl", encoding="utf-8") if line.strip()]
-        decisions = invented = not_covered_ok = answered_ok = revised = still_unsupported = fake_evidence = 0
+        decisions = invented = not_covered_ok = answered_ok = revised = still_unsupported = fake_evidence = fell_back = 0
         for row in rows:
             result = app.invoke({"question": row["question"]},
                                 config={"run_name": "plantpal", "tags": ["plantpal", "test", "step2b"],
                                         "metadata": {"row_id": row["id"], "group": row["group"]}})
             decisions += result["need_retrieval"] == row["expected_retrieve"]
+            retrieved = [doc.metadata["id"] for doc in result.get("docs", [])]
             relevant = [doc.metadata["id"] for doc in result.get("relevant_docs", [])]
             cited = citation.findall(result["answer"])
             flags = []
@@ -291,18 +327,21 @@ if __name__ == "__main__":
             if "evidence_ok" in result and not result["evidence_ok"]:
                 fake_evidence += 1
                 flags.append("FAKE EVIDENCE QUOTE")
+            if result.get("fell_back"):
+                fell_back += 1
+                flags.append("FELL BACK")
             if row["group"] == "not_in_library":
                 not_covered_ok += result["answer"] == NOT_COVERED
             if row["group"] == "answerable":
                 answered_ok += row["plant_id"] in cited
-            retrieved = [doc.metadata["id"] for doc in result.get("docs", [])]
             print(f"\n{row['id']} {row['group']:15} retrieved={retrieved} relevant={relevant} issup={result.get('issup', '-')} "
                   f"revisions={result.get('revisions', 0)}" + (f"   <-- {', '.join(flags)}" if flags else ""))
             if result.get("unsupported"):
                 print(f"   unsupported (last check): {result['unsupported']}")
             print(f"   A: {result['answer'][:240]}")
         print(f"\nretrieval decisions: {decisions}/20 (step 2a 20/20)")
-        print(f"invented feeding advice: {invented}/4 (step 2a 3/4)")
+        print(f"invented feeding advice: {invented}/4 (step 2a 3/4, step 2b without fallback 3/4)")
         print(f"not-in-library answered 'not covered': {not_covered_ok}/3 (step 2a 3/3)")
         print(f"answerable rows citing the right sheet: {answered_ok}/6 (step 2a 6/6)")
-        print(f"answers revised: {revised}   ended not fully supported: {still_unsupported}   fake evidence quotes: {fake_evidence}")
+        print(f"answers revised: {revised}   ended not fully supported: {still_unsupported}   "
+              f"fell back: {fell_back}   fake evidence quotes: {fake_evidence}")
