@@ -17,7 +17,7 @@ The project was built in three steps, and the middle one took six measured attem
 - [Step 2: Relevance, Support and a Safety Net](#step-2-relevance-support-and-a-safety-net)
 - [Step 3: Usefulness and Rewriting](#step-3-usefulness-and-rewriting)
 - [Results](#results)
-- [How It Differs from the Course Notebook](#how-it-differs-from-the-course-notebook)
+- [Design Choices](#design-choices)
 - [What the Project Taught](#what-the-project-taught)
 - [Project Structure](#project-structure)
 - [How to Run](#how-to-run)
@@ -207,9 +207,9 @@ The rewrites themselves were good: they added real alternative names ("snake pla
 
 ---
 
-## How It Differs from the Course Notebook
+## Design Choices
 
-| Notebook | PlantPal | Why |
+| Common Self-RAG setup | PlantPal | Why |
 |---|---|---|
 | Up to 10 revisions and 3 rewrites, with a recursion limit of 80 | At most 1 of each, enforced in code | Each extra loop costs calls and rarely changes the answer |
 | The judge's evidence quotes are trusted | Every quote must appear in the sheets, checked in code | The judge can invent its evidence too |
