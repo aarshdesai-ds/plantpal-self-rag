@@ -279,6 +279,8 @@ def is_use(state: GraphState):
 def route_after_use(state: GraphState) -> Literal['__end__', "rewrite_query"]:
     if state['isuse'] == "useful":
         return END
+    elif state.get("relevant_docs"):
+        return END
     elif state.get("rewrites", 0) < MAX_REWRITES:
         return "rewrite_query"
     return END
@@ -365,8 +367,10 @@ if __name__ == "__main__":
     print("ok  " if route_after_sup({"issup": "partially_supported", "revisions": 1}) == "fallback" else "FAIL", "cap reached -> fallback")
     print("ok  " if route_after_sup({"issup": "no_support", "revisions": 0}) == "revise" else "FAIL", "no support also revises once")
     print("ok  " if route_after_use({"isuse": "useful"}) == END else "FAIL", "useful ends")
-    print("ok  " if route_after_use({"isuse": "not_useful"}) == "rewrite_query" else "FAIL", "not useful, no rewrite yet -> rewrite_query")
+    print("ok  " if route_after_use({"isuse": "not_useful"}) == "rewrite_query" else "FAIL", "not useful, nothing relevant, no rewrite yet -> rewrite_query")
     print("ok  " if route_after_use({"isuse": "not_useful", "rewrites": 1}) == END else "FAIL", "not useful after a rewrite -> end")
+    print("ok  " if route_after_use({"isuse": "not_useful", "relevant_docs": [pothos]}) == END else "FAIL",
+          "not useful but the right sheet was found -> end (no rewrite)")
 
     print("\n--- quote_found and bullet_list (free) ---")
     context = "[english_ivy]\nEnglish Ivy (light: medium; toxicity: toxic to pets)\n\n## Pets\nToxic to pets."
