@@ -30,8 +30,13 @@ NOT_A_CLAIM = re.compile(
     r"|\bnot\s+(covered|specified|mentioned|stated|listed|included)\b",
     re.IGNORECASE)
 
-def real_claims(unsupported):
-    return [claim for claim in unsupported if not NOT_A_CLAIM.search(claim)]
+ANSWER_LABEL = re.compile(r"^\s*answer:\s*", re.IGNORECASE)
+
+def real_claims(unsupported, answer=""):
+    not_covered = [s.lower() for s in re.split(r"(?<=[.!?])\s+", answer) if NOT_A_CLAIM.search(s)]
+    return [claim for claim in unsupported
+            if not NOT_A_CLAIM.search(claim)
+            and not any(claim.lower().strip(" .") in sentence for sentence in not_covered)]
 
 def invents_frequency(answer):
     sentences = re.split(r"(?<=[.!?])\s+", answer)
@@ -186,7 +191,7 @@ def is_sup(state: GraphState):
     evidence_ok = all(quote_found(item, state['context']) for item in evidence)
     if issup == "fully_supported" and not evidence_ok:
         issup = "partially_supported"
-    unsupported = real_claims(unsupported)
+    unsupported = real_claims(unsupported, state['answer'])
     if issup != "fully_supported" and not unsupported and evidence_ok:
         issup = "fully_supported"
     return {"issup": issup, "evidence": evidence, "unsupported": unsupported, "evidence_ok": evidence_ok}
@@ -201,6 +206,7 @@ def revise(state: GraphState):
     unsupported = state.get("unsupported", [])
     unsupported_text = bullet_list(unsupported)
     answer = revise_chain.invoke({"question": state['question'],"unsupported": unsupported_text, "answer": state['answer'], "context": state['context']}).content
+    answer = ANSWER_LABEL.sub("", answer)
     revisions = state.get("revisions", 0) + 1
     return {"answer": answer, "revisions": revisions}
 
@@ -223,6 +229,7 @@ def build_fallback(evidence, relevant_docs):
 def fallback(state: GraphState):
     answer = build_fallback(state.get("evidence", []), state.get("relevant_docs", []))
     return {"answer": answer, "fell_back": True, "replaced_answer": state["answer"]}
+
 def route_after_sup(state: GraphState) -> Literal["__end__", "revise", "fallback"]:
     if state['issup'] == "fully_supported":
         return END
@@ -230,6 +237,7 @@ def route_after_sup(state: GraphState) -> Literal["__end__", "revise", "fallback
         return "revise"
     else:
         return "fallback"
+
 graph = StateGraph(GraphState)
 
 graph.add_node("decide_retrieval", decide_retrieval)
@@ -316,18 +324,25 @@ if __name__ == "__main__":
     print("ok  " if build_fallback(["Feed every 4 weeks."], [snake]) == NOT_COVERED else "FAIL", "no verified quotes -> NOT_COVERED")
     print("ok  " if build_fallback([], [snake]) == NOT_COVERED else "FAIL", "no evidence at all -> NOT_COVERED")
 
-    print("\n--- real_claims (free) ---")
+    print("\n--- real_claims and the answer label (free) ---")
     print("ok  " if real_claims(["The care sheet doesn't cover symptoms of toxicity."]) == [] else "FAIL", "'doesn't cover' is not a claim")
     print("ok  " if real_claims(["Feeding frequency is not covered in the care sheets."]) == [] else "FAIL", "'not covered' is not a claim")
     print("ok  " if real_claims(["Fertilize your ZZ plant every few months."]) == ["Fertilize your ZZ plant every few months."]
           else "FAIL", "an invented claim stays")
-    print("ok  " if real_claims(["Feeding frequency"]) == ["Feeding frequency"] else "FAIL", "a bare topic stays (conservative)")
+    print("ok  " if real_claims(["Feeding frequency"]) == ["Feeding frequency"] else "FAIL", "a bare topic stays when the answer doesn't mention it")
+    honest = "It is toxic to cats [snake_plant]. The care sheet doesn't cover feeding frequency or fertilizer type."
+    print("ok  " if real_claims(["feeding frequency", "fertilizer type"], honest) == [] else "FAIL",
+          "bare topics the answer says aren't covered are not claims")
+    invented = "Fertilize your ZZ plant every few months. The care sheet doesn't cover fertilization frequency."
+    print("ok  " if real_claims(["Fertilize your ZZ plant every few months."], invented) == ["Fertilize your ZZ plant every few months."]
+          else "FAIL", "an invented sentence stays, even beside a 'doesn't cover' line")
+    print("ok  " if ANSWER_LABEL.sub("", "Answer:\nIt is toxic to cats.") == "It is toxic to cats." else "FAIL", "'Answer:' label stripped")
 
     if len(sys.argv) > 1 and sys.argv[1] == "step2b":
         print("\n--- step 2b: is_sup + revise + fallback, on all 20 questions (about 130 model calls) ---")
         citation = re.compile(r"\[([a-z_]+)\]")
         rows = [json.loads(line) for line in open("eval/questions.jsonl", encoding="utf-8") if line.strip()]
-        decisions = invented = not_covered_ok = answered_ok = revised = still_unsupported = fake_evidence = fell_back = 0
+        decisions = invented_count = not_covered_ok = answered_ok = revised = still_unsupported = fake_evidence = fell_back = 0
         for row in rows:
             result = app.invoke({"question": row["question"]},
                                 config={"run_name": "plantpal", "tags": ["plantpal", "test", "step2b"],
@@ -338,7 +353,7 @@ if __name__ == "__main__":
             cited = citation.findall(result["answer"])
             flags = []
             if row["missing_part"] == "feeding" and invents_frequency(result["answer"]):
-                invented += 1
+                invented_count += 1
                 flags.append("INVENTED FEEDING")
             if result.get("revisions", 0):
                 revised += 1
@@ -363,7 +378,7 @@ if __name__ == "__main__":
                 print(f"   replaced: {result['replaced_answer'][:240]}")
             print(f"   A: {result['answer'][:240]}")
         print(f"\nretrieval decisions: {decisions}/20 (step 2a 20/20)")
-        print(f"invented feeding advice: {invented}/4 (step 2a 3/4, step 2b without fallback 3/4)")
+        print(f"invented feeding advice: {invented_count}/4 (step 2a 3/4, step 2b without fallback 3/4)")
         print(f"not-in-library answered 'not covered': {not_covered_ok}/3 (step 2a 3/3)")
         print(f"answerable rows citing the right sheet: {answered_ok}/6 (step 2a 6/6)")
         print(f"answers revised: {revised}   ended not fully supported: {still_unsupported}   "
